@@ -1,0 +1,6 @@
+langchain-groq
+langgraph
+duckduckgo-search==6.3.3
+streamlit
+python-dotenv
+pytest
