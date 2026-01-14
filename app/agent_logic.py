@@ -1,36 +1,39 @@
 import os
 from typing import TypedDict, Annotated, List, Dict
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
-from duckduckgo_search import DDGS
+from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 
-load_dotenv()
+# Cerca il .env salendo di una cartella
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
-def travel_web_search(query: str):
-    try:
-        with DDGS() as ddgs:
-            clean_query = f"{query} -shoes -scarpe -zalando -ai -software"
-            results = []
-            for r in ddgs.text(clean_query, region='it-it', max_results=5):
-                results.append(f"INFO: {r['title']} | DESC: {r['body']} | URL: {r['href']}")
-            return "\n\n".join(results) if results else "Nessun dato web trovato."
-    except Exception:
-        return "Errore connessione ricerca."
+class TravelProfile(BaseModel):
+    partenza: str = Field(default="Mancante")
+    destinazione: str = Field(default="Mancante")
+    date: str = Field(default="Mancante")
+    budget: str = Field(default="Mancante")
+    interessi: str = Field(default="Mancante")
+    gruppo: str = Field(default="Mancante")
 
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], lambda x, y: x + y]
-    user_data: Dict[str, str]
+    profile: TravelProfile
     next_node: str
 
 class TravelAgent:
     def __init__(self):
-        self.llm = ChatGroq(
-            temperature=0,
-            model_name="llama-3.3-70b-versatile",
-            groq_api_key=os.getenv("GROQ_API_KEY")
-        )
+        # .strip() rimuove spazi accidentali
+        tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        
+        if not tavily_key:
+            raise ValueError("TAVILY_API_KEY non trovata. Controlla il file .env alla radice!")
+        
+        self.llm = ChatGroq(temperature=0, model_name="llama-3.3-70b-versatile", api_key=groq_key)
+        self.search = TavilySearchResults(max_results=5, search_depth="advanced", tavily_api_key=tavily_key)
 
         workflow = StateGraph(AgentState)
         workflow.add_node("analyzer", self._analyzer_node)
@@ -38,49 +41,44 @@ class TravelAgent:
         workflow.add_node("architect", self._architect_node)
         
         workflow.set_entry_point("analyzer")
-        workflow.add_conditional_edges("analyzer", lambda x: x["next_node"], {"research": "researcher", "ask": END})
+        workflow.add_conditional_edges("analyzer", self._router, {"research": "researcher", "ask": END})
         workflow.add_edge("researcher", "architect")
         workflow.add_edge("architect", END)
         self.app = workflow.compile()
 
     def _analyzer_node(self, state: AgentState):
-        prompt = """Analizza la chat ed estrai le info. Se mancano, chiedile. 
-        Se hai TUTTO, scrivi 'READY_TO_SEARCH' e riassumi: Partenza, Destinazione, Date, Budget, Interessi, Gruppo."""
-        res = self.llm.invoke([HumanMessage(content=prompt)] + state['messages'])
-        is_ready = "READY_TO_SEARCH" in res.content
-        return {
-            "messages": [res],
-            "next_node": "research" if is_ready else "ask",
-            "user_data": {"summary": res.content}
-        }
+        structured_llm = self.llm.with_structured_output(TravelProfile)
+        new_profile = structured_llm.invoke(state["messages"])
+        
+        # Campi minimi per procedere (Planning Pattern)
+        fields = ["partenza", "destinazione", "date", "budget", "interessi", "gruppo"]
+        ready = all(getattr(new_profile, f) != "Mancante" for f in fields)
+        
+        prompt = f"Sei un Travel Agent. Dati correnti: {new_profile.json()}. Se manca qualcosa chiedila, altrimenti conferma l'inizio della ricerca."
+        res = self.llm.invoke([HumanMessage(content=prompt)] + state["messages"])
+        
+        return {"messages": [res], "profile": new_profile, "next_node": "research" if ready else "ask"}
 
-    # Metodo helper per la Sidebar (Pag. 289: Trasparenza)
-    def get_structured_data(self, history: list):
-        prompt = """Analizza la conversazione e restituisci SOLO i valori estratti per questi campi:
-        Partenza, Destinazione, Date, Budget, Interessi, Gruppo.
-        Usa 'Mancante' se il dato non è presente. Rispondi con un elenco puntato."""
-        res = self.llm.invoke([HumanMessage(content=prompt)] + history)
-        return res.content
+    def _router(self, state: AgentState):
+        return state["next_node"]
 
     def _research_node(self, state: AgentState):
-        summary = state["user_data"]["summary"]
-        return {
-            "user_data": {
-                "flights": travel_web_search(f"voli reali prezzi per {summary}"),
-                "hotels": travel_web_search(f"hotel reali prezzi per {summary}"),
-                "summary": summary
-            }
-        }
+        p = state["profile"]
+        q_flights = f"prezzi voli aerei e compagnie da {p.partenza} a {p.destinazione} {p.date}"
+        q_hotels = f"nomi hotel e prezzi a {p.destinazione} budget {p.budget} booking.com"
+        
+        res_flights = self.search.invoke(q_flights)
+        res_hotels = self.search.invoke(q_hotels)
+        return {"messages": [AIMessage(content=f"VOLI: {res_flights}\n\nHOTEL: {res_hotels}")]}
 
     def _architect_node(self, state: AgentState):
-        data = state["user_data"]
-        prompt = f"""Crea un itinerario per la destinazione richiesta: {data['summary']}.
-        Usa i dati web: Voli: {data['flights']}, Hotel: {data['hotels']}.
-        Rispetta il budget. Se mancano dati reali, usa la tua conoscenza per hotel reali a {data['summary']}."""
+        raw_data = state["messages"][-1].content
+        prompt = f"""Crea un itinerario per {state['profile'].destinazione}.
+        DATI REALI: {raw_data}
+        DEVI INCLUDERE TABELLE CON NOMI, PREZZI E LINK CLICCABILI."""
         res = self.llm.invoke(prompt)
         return {"messages": [res]}
 
-    def run(self, user_input: str, history: list):
-        inputs = {"messages": history + [HumanMessage(content=user_input)], "user_data": {}, "next_node": ""}
-        result = self.app.invoke(inputs)
-        return result["messages"][-1].content
+    def run(self, user_input: str, history: list, profile: TravelProfile):
+        inputs = {"messages": history + [HumanMessage(content=user_input)], "profile": profile, "next_node": ""}
+        return self.app.invoke(inputs)

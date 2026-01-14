@@ -1,6 +1,8 @@
 langchain-groq
+langchain-community
+langchain-core
 langgraph
-duckduckgo-search==6.3.3
+tavily-python
 streamlit
 python-dotenv
 pytest
